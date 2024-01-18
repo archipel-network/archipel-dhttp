@@ -47,8 +47,10 @@ async fn main() {
 
     println!("Using Archipel Core socket {}", socket_path.to_string_lossy());
 
-    let stream = task::spawn_blocking(|| UnixStream::connect(socket_path) ).await.unwrap().unwrap();
-    let send_agent = task::spawn_blocking(|| Agent::connect(stream, agent_id) ).await.unwrap().unwrap();
+    let stream = task::spawn_blocking(||
+        UnixStream::connect(socket_path) ).await.unwrap().unwrap();
+    let send_agent = task::spawn_blocking(||
+        Agent::connect(stream, agent_id) ).await.unwrap().unwrap();
 
     let state = Arc::new(State {
         destination_agent_id: cli.agent_id,
@@ -69,38 +71,59 @@ async fn main() {
 async fn handle_dtn_request(req: tide::Request<StateHandle>) -> Result<Response, http_types::Error>{
     let state = req.state().clone();
     
-    let host = get_target_eid(&req.as_ref());
-    if let None = host {
-        let mut res = Response::new(StatusCode::BadRequest);
-        res.set_body("Missing host header; Host header is required to route on DTN");
-        return Ok(res)
-    }
-    let mut host = host.unwrap();
-
-    if host == "localhost" || host == "127.0.0.1" {
-        let agent = state.send_agent.lock();
-        let current_eid = agent.unwrap().node_eid.clone();
-        host = current_eid[6..current_eid.len()-1].to_owned();
-    }
+    let host = get_target_eid(&req.as_ref())
+                .map(|it| {
+                    // Redirect to our node if host is local
+                    if it == "localhost" || it == "127.0.0.1" {
+                        let agent = state.send_agent.lock();
+                        let current_eid = agent.unwrap().node_eid.clone();
+                        current_eid[6..current_eid.len()-1].to_owned()
+                    } else { it }
+                })
+                .ok_or(Rejection::MissingHostHeader)?;
 
     let bundle_content = dhttp::from_http(req.into()).await
-        .map_err(|it| tide::Error::new(
-            StatusCode::InternalServerError,
-            anyhow!("Failed to create a bundle for the privided request : {}", it)))?;
+        .map_err(|it| {
+            eprintln!("Failed to create a bundle for the provided request : {}", it);
+            Rejection::InternalServerError
+        })?;
 
-
-        {
-            state.send_agent.lock().unwrap().send_bundle(
-                format!("dtn://{}/{}", host, state.destination_agent_id),
-                &bundle_content
-            )
-            .map_err(|it| tide::Error::new(
-                StatusCode::InternalServerError,
-                it))?;
-        }
+    {
+        state.send_agent.lock().unwrap().send_bundle(
+            format!("dtn://{}/{}", host, state.destination_agent_id),
+            &bundle_content
+        )
+        .map_err(|it| {
+            eprintln!("Failed to send bundle for the provided request : {}", it);
+            Rejection::InternalServerError
+        })?;
+    }
 
     Ok(Response::from("Bundle sent"))
 }
+
+enum Rejection {
+    InternalServerError,
+    MissingHostHeader
+}
+
+impl From<Rejection> for tide::Error {
+    fn from(value: Rejection) -> Self {
+        match value {
+            
+            Rejection::InternalServerError => tide::Error::new(
+                StatusCode::InternalServerError,
+                anyhow!("Internal server error")),
+
+            Rejection::MissingHostHeader => tide::Error::new(
+                StatusCode::BadRequest,
+                anyhow!("Missing host header; Host header is required to route on DTN")
+            ),
+
+        }
+    }
+}
+
 
 type StateHandle = Arc<State>;
 
