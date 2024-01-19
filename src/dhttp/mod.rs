@@ -1,3 +1,9 @@
+pub mod proxy;
+pub use proxy::Proxy;
+
+pub mod server;
+pub use server::Server;
+
 use futures_lite::AsyncReadExt;
 use http_types::{Request, Error};
 use async_h1::client::Encoder;

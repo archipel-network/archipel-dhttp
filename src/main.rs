@@ -1,17 +1,15 @@
 extern crate libc;
 
-use std::{net::SocketAddr, sync::{Arc, Mutex}, path::PathBuf, os::unix::net::UnixStream};
+use std::{net::SocketAddr, path::PathBuf, os::unix::net::UnixStream};
 
-use anyhow::anyhow;
 use clap::Parser;
-use dhttp::get_target_eid;
-use http_types::StatusCode;
 use libc::getuid;
-use tide::Response;
-use ud3tn_aap::{Agent, UnixAgent};
-use tokio::task;
+use ud3tn_aap::Agent;
+use async_std::task;
 
 mod dhttp;
+use dhttp::Proxy;
+use dhttp::Server;
 
 #[derive(Debug, Parser)]
 #[command(author, version, about, long_about = None)]
@@ -25,11 +23,14 @@ struct CLI {
     #[arg(short = 'A', long, default_value = "www")]
     agent_id: String,
 
+    #[arg(short = 'F', long = "files", default_value = "./www")]
+    files_root: PathBuf,
+
     #[arg(short = 'S', long)]
     socket_path: Option<PathBuf>
 }
 
-#[tokio::main]
+#[async_std::main]
 async fn main() {
     let cli = CLI::parse();
 
@@ -43,91 +44,35 @@ async fn main() {
         },
     };
 
-    let agent_id = cli.send_agent_id;
+    let agent_id = cli.send_agent_id.clone();
 
     println!("Using Archipel Core socket {}", socket_path.to_string_lossy());
 
-    let stream = task::spawn_blocking(||
-        UnixStream::connect(socket_path) ).await.unwrap().unwrap();
-    let send_agent = task::spawn_blocking(||
-        Agent::connect(stream, agent_id) ).await.unwrap().unwrap();
+    let send_socket_path = socket_path.clone();
 
-    let state = Arc::new(State {
-        destination_agent_id: cli.agent_id,
-        send_agent: Mutex::new(send_agent)
-    });
+    let send_stream = task::spawn_blocking(||
+        UnixStream::connect(send_socket_path) ).await.unwrap();
 
-    let mut app = tide::with_state(state);
-    
-    app
-        .at("/").all(handle_dtn_request)
-        .at("*").all(handle_dtn_request)
-        ;
-
-    println!("Starting HTTP server on {}", cli.bind);
-    app.listen(cli.bind).await.unwrap();
-}
-
-async fn handle_dtn_request(req: tide::Request<StateHandle>) -> Result<Response, http_types::Error>{
-    let state = req.state().clone();
-    
-    let host = get_target_eid(&req.as_ref())
-                .map(|it| {
-                    // Redirect to our node if host is local
-                    if it == "localhost" || it == "127.0.0.1" {
-                        let agent = state.send_agent.lock();
-                        let current_eid = agent.unwrap().node_eid.clone();
-                        current_eid[6..current_eid.len()-1].to_owned()
-                    } else { it }
-                })
-                .ok_or(Rejection::MissingHostHeader)?;
-
-    let bundle_content = dhttp::from_http(req.into()).await
-        .map_err(|it| {
-            eprintln!("Failed to create a bundle for the provided request : {}", it);
-            Rejection::InternalServerError
-        })?;
-
-    {
-        state.send_agent.lock().unwrap().send_bundle(
-            format!("dtn://{}/{}", host, state.destination_agent_id),
-            &bundle_content
-        )
-        .map_err(|it| {
-            eprintln!("Failed to send bundle for the provided request : {}", it);
-            Rejection::InternalServerError
-        })?;
-    }
-
-    Ok(Response::from("Bundle sent"))
-}
-
-enum Rejection {
-    InternalServerError,
-    MissingHostHeader
-}
-
-impl From<Rejection> for tide::Error {
-    fn from(value: Rejection) -> Self {
-        match value {
-            
-            Rejection::InternalServerError => tide::Error::new(
-                StatusCode::InternalServerError,
-                anyhow!("Internal server error")),
-
-            Rejection::MissingHostHeader => tide::Error::new(
-                StatusCode::BadRequest,
-                anyhow!("Missing host header; Host header is required to route on DTN")
-            ),
-
-        }
-    }
-}
+    let send_agent = task::spawn_blocking(move ||
+        Agent::connect(send_stream, agent_id) ).await.unwrap();
 
 
-type StateHandle = Arc<State>;
+    let receive_socket_path = socket_path.clone();
+    let www_agent_id = cli.agent_id.clone();
 
-struct State {
-    pub destination_agent_id: String,
-    pub send_agent: Mutex<UnixAgent>
+    let receive_stream = task::spawn_blocking(||
+        UnixStream::connect(receive_socket_path) ).await.unwrap();
+        
+    let receive_agent = task::spawn_blocking(move || {
+        Agent::connect(receive_stream, www_agent_id)
+    }).await.unwrap();
+
+    let server = Server::new(receive_agent, cli.files_root.clone())
+        .unwrap();
+    task::spawn(server.bind());
+
+    let proxy = Proxy::new(send_agent, cli.agent_id.clone());
+    println!("Starting proxy on http://{}/", cli.bind);
+    proxy.bind(cli.bind).await.unwrap();
+
 }
